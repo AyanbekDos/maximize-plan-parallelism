@@ -1,0 +1,6 @@
+interface:
+  display_name: "Maximize Plan Parallelism"
+  short_description: "Orchestrate one-task DAG execution safely"
+  default_prompt: "Use $maximize-plan-parallelism to turn this large implementation plan into a durable DAG and execute safe parallel waves inside this active Sol Ultra task."
+policy:
+  allow_implicit_invocation: true
