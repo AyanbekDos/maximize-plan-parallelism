@@ -1,6 +1,6 @@
 interface:
   display_name: "Maximize Plan Parallelism"
-  short_description: "Orchestrate one-task DAG execution safely"
-  default_prompt: "Use $maximize-plan-parallelism to turn this large implementation plan into a durable DAG and execute safe parallel waves inside this active Sol Ultra task."
+  short_description: "Coordinate parallel Codex tasks and accept results"
+  default_prompt: "Use $maximize-plan-parallelism to split this work into independent tasks, honor my chosen chat setup and models, and coordinate only the planning or implementation I requested."
 policy:
   allow_implicit_invocation: true

@@ -1,115 +1,79 @@
 ---
 name: maximize-plan-parallelism
-description: Convert a large repo-grounded implementation plan into a dependency-safe DAG and execute it with native subagents inside one active Codex Sol Ultra task. Use when work needs durable root-owned orchestration, interface freezes, exclusive path ownership, capacity-aware waves, recovery after context compaction, and final integration evidence. Do not use for small changes or to create sidebar tasks.
+description: Decompose substantial work into dependency-safe parallel tasks and coordinate delivery. Supports separate Codex chats when the user requests them, or native subagents otherwise, with explicit ownership, shared contracts, recovery, and root acceptance. Also supports planning without starting implementation.
 ---
 
 # Maximize Plan Parallelism
 
-Act as the sole root orchestrator for one active Codex task. Keep the plan, dispatch, reconciliation, integration, and final proof in this task. Use native subagents as workers; never create, fork, or coordinate separate sidebar tasks for DAG nodes.
+Optimize for the user's finished result, not agent count or planning artifacts. The current task owns scope, interfaces, dispatch, integration and acceptance. Workers own bounded outcomes.
 
-## Establish the execution boundary
+## Match the requested operation
 
-1. Inspect the real repository, its local instructions, current status, the supplied plan, and the authoritative acceptance criteria before decomposing anything.
-2. Separate current implementation facts, accepted decisions, hypotheses, history, and unknowns. Do not turn an old plan into current authority silently.
-3. Preserve the user's requested model. Before execution dispatch, verify that the active root is Sol Ultra and that native subagents inherit that model and reasoning unless the user explicitly requests another choice. If either condition is false or unverifiable, stop after the validated DAG and report the mismatch; never downgrade silently.
-4. If native subagent tools are unavailable, produce and validate the DAG but stop before claiming parallel execution.
-5. Respect the request's mutation boundary. A planning or forward-test request is read-only even though the graph describes implementation.
+- **Plan:** inspect the baseline, split work and prepare task cards. Do not dispatch implementation or require runtime acceptance to finish a plan. Useful bounded read-only investigation may be delegated within the authorized scope.
+- **Prepare tasks:** when requested, create tasks with concrete preparation-only instructions and a stopping point. Creating a task runs its prompt; it is not an inert placeholder. Do not authorize implementation implicitly.
+- **Execute:** implement the authorized scope, dispatch ready work, integrate results and verify the assembled outcome. Continue without repeatedly asking the owner to manage routine technical decisions.
 
-## Persist the control plane outside the repo
+Infer the operation from the request and existing authorization. A planning or status request does not authorize deployment, publishing, purchases or a product rewrite. If ambiguity would start unauthorized implementation, finish independent planning and clarify only that boundary.
 
-Before spawning a worker, create a run directory under the personal Codex state directory, normally `~/.codex/orchestrations/<repo-slug>/<run-id>/`. A read-only forward test may instead use an explicitly supplied isolated output directory. Never place orchestration state in the repo or a worker worktree.
+“Create the chats, but do not develop yet” means prepare tasks, not refuse task creation. “Only show me how to split it” means deliver the plan. Separate task creation still requires the explicit request below.
 
-Only the root writes these files:
+Choose transport separately:
 
-- `brief.md` - frozen goal, authority sources, baseline revision, acceptance criteria, constraints, and unknowns.
-- `dag.json` - frozen semantic DAG and task cards.
-- `events.jsonl` - append-only state transitions and agent assignments.
-- `receipts/<node-id>.json` - normalized worker handoffs copied by the root.
-- `final-report.md` - acceptance matrix and final evidence.
+- Explicit request for separate chats/tasks: use Codex task tools and read [thread-orchestration.md](references/thread-orchestration.md).
+- Otherwise use native subagents for suitable bounded work. Do not create sidebar tasks without the user's request; respect live native capacity.
+- Honor chosen worker models/effort; otherwise omit overrides. Root and workers need not use the same model. An unavailable requested model blocks that dispatch, not unrelated work. Never silently downgrade or claim to change/verify the current root model without supporting runtime information.
 
-Read [the orchestration contract](references/orchestration-contract.md) before dispatch or recovery. Read [the DAG schema](references/dag-schema.md) when creating `dag.json` or running the checker.
+## Split real work
 
-## Build the semantic DAG
+Read current decisions, the supplied plan, relevant code, local instructions and working-tree status. Distinguish decisions, implementation facts, unknowns and history. Preserve accepted interfaces, visuals and approved prompts.
 
-Decompose by independently observable outcomes, not by activities or arbitrary file counts. A worker node should normally have:
+Each worker card needs:
 
-- one outcome a reviewer can observe;
-- one primary subsystem and an exclusive write boundary;
-- explicit read-only inputs and forbidden paths;
-- concrete deliverables and targeted verification;
-- acceptance-criterion IDs;
-- prerequisites with a specific reason for every edge.
+1. One observable outcome and acceptance conditions.
+2. Exact baseline and essential context usable without the parent conversation.
+3. Prerequisites, with a reason each is necessary.
+4. Allowed write paths, read-only inputs and forbidden/shared paths.
+5. Input/output interface and artifacts to return.
+6. Targeted verification and when to report missing prerequisites or scope conflicts.
 
-Create an `interface_freeze` node before parallel consumers when signatures, schemas, event shapes, migrations, fixtures, or other shared contracts are not stable. When the contract already exists, the node may be a read-only gate that pins its exact baseline and proves that no consumer may redefine it; do not invent interface churn merely to satisfy the graph. A consumer may start only after its producer is `integrated`.
+Split by independently verifiable results, not arbitrary file counts. Related files may belong to one task. Stabilize a shared interface only when consumers actually need it; pin usable existing types rather than rewriting them. Independent tasks need no dummy foundation gate. A consumer of a changed interface starts after it is accepted in the consumer's baseline. Useful read-only preparation may proceed earlier without inventing that interface.
 
-Keep these concepts separate:
+Separate semantic dependencies from scheduling limits. Two independent tasks may still need serial access to a file, browser, database or test runner. Prefer separate ownership or isolated worktrees; declare genuine shared resources when they cannot be divided.
 
-- DAG edges are semantic prerequisites. Removing one would make the dependent result invalid or unknowable.
-- Shared hot paths, exclusive resources, heavy-test groups, and worker capacity are scheduling constraints. They serialize starts without inventing false dependency edges.
+## Dispatch a rolling ready queue
 
-Detect every write/write overlap. First try to split ownership. If the shared file is genuinely indivisible, declare it in `shared_hot_paths` with a concrete reason and never run the affected nodes together. Treat an unordered write/read overlap as a planning error: add the real dependency or redesign the boundary.
+Use available capacity and the user's cost preferences. Start more workers only for more useful independent outcomes. Reserve root attention for integration.
 
-Re-split a card before implementation when it combines several observable outcomes, crosses independent subsystems, owns too many unrelated paths, asks a worker to run the full suite, or cannot be verified without another unfinished card. A broad root-only gate is allowed only with an explicit `split_exception` explaining why it cannot safely be divided.
+After a completion, failure, instruction or capacity change:
 
-## Validate before dispatch
+1. Reconcile the affected task with live status, outputs and changed paths.
+2. Accept and integrate it, or return a concrete correction to the same task.
+3. Find tasks whose prerequisites are integrated, baseline is available and relevant locks are free.
+4. Dispatch those that fit capacity. Do not wait for an unrelated slow branch or unrelated result awaiting review.
 
-Run:
+Root ownership does not imply global exclusivity. The root may accept one branch or make an independent change while other workers continue. Reserve global pauses for operations that genuinely need them. Results awaiting review hold their own relevant path/resource locks, not all capacity.
 
-```text
-python <skill-dir>/scripts/check_orchestration.py <run-dir>/dag.json --json
-```
+Illustrative DAG waves are not synchronization barriers. Contract acceptance, reviews and checks can release dependent tasks as soon as their actual inputs are ready.
 
-Do not dispatch while the checker reports an error. Review its derived waves and serialization reasons; the graph is not frozen merely because it is acyclic.
+## Keep enough state to recover
 
-After first dispatch, treat `brief.md` and `dag.json` as frozen. If repo evidence forces a change, stop affected nodes, record the reason, write a new DAG revision, rerun the checker, and then resume. Workers never edit the DAG or ledger.
+A short planning request may need only a task table. For execution or many separate chats, keep root-owned state outside worker write sets, normally `~/.codex/orchestrations/<project>/<run-id>/`:
 
-## Run capacity-aware waves
+- `plan.md` or `dag.json`: scope, baselines, cards, dependencies and acceptance.
+- `threads.json`: node/attempt to real task ID, host, checkout, requested model and wait cursor; equivalent bindings for native agents.
+- `events.jsonl`: assignments and state changes.
+- `receipts/`: returned work and root acceptance evidence when available.
 
-For each wave:
+Do not create empty reports merely to satisfy a template. Read [orchestration-contract.md](references/orchestration-contract.md) for handoff, integration and recovery. Root alone updates orchestration state and the shared integration baseline. Workers may produce local commits if authorized; publishing/merging or expanding ownership is not implicit in assignment.
 
-1. Replay `events.jsonl`, inspect repo status/diffs, and reconcile the ledger with the live native-subagent registry.
-2. Compute the ready frontier: only nodes whose prerequisites are `integrated` qualify. `worker_done` and `verified` are not dependency completion.
-3. Determine live worker capacity after reserving the root for orchestration and integration. Spawn only the non-conflicting ready nodes that fit it; do not target a large agent count.
-4. Give each worker exactly one task card, the frozen baseline/current integration state, owned paths, forbidden paths, commands allowed for targeted verification, and the receipt contract.
-5. Use native subagent operations attached to this task for spawn, follow-up, waiting, and status inspection. Do not use task/thread management operations such as `create_thread`, `fork_thread`, `send_message_to_thread`, or `wait_threads` for DAG workers.
-6. While workers run, the root may inspect and prepare integration, but must not edit an active worker's owned paths.
+When machine validation helps, use [dag-schema.md](references/dag-schema.md) and `scripts/check_orchestration.py`. It validates declared structure and ledger consistency, not actual product behavior or permissions. Planning/prepare mode requires no fake execution gates or full suite.
 
-Workers return evidence; they do not declare themselves integrated. For each completion, the root inspects the actual diff/artifact, checks path ownership, runs or validates targeted verification once, records a receipt, and advances:
+After interruption, match recorded bindings to live tasks and artifacts before retrying, reassigning or creating a duplicate. An unknown outcome is neither success nor failure. Continue unrelated ready work.
 
-```text
-planned -> claimed -> running -> worker_done -> verified -> integrated
-```
+## Accept the requested result
 
-Use `blocked`, `failed`, or `orphaned` with evidence when necessary. A dependent remains blocked until the prerequisite reaches `integrated`.
+Worker completion is a handoff. Inspect actual artifacts/diff, relevant checks and ownership. Integrate into the named baseline before releasing consumers. A receipt identifies node/attempt, baseline, changed paths, outputs, checks, limitations and new dependencies. Accept a compact response for a simple task and normalize it yourself.
 
-Avoid duplicated heavy tests. Workers run narrow checks. Assign each heavy-test group at most once per wave, run shared subsystem gates after the relevant wave, and reserve the complete integration suite for the final stage.
+Choose final checks from the user's acceptance conditions. Restart/replay matters for persistent state; rendered inspection for UI; end-to-end use for an integrated product. Do not require every gate or a heavy full suite universally. Run shared expensive checks once on the appropriate integrated state, then repeat only what a new change/failure justifies.
 
-## Recover instead of forgetting
-
-At the start of every wave and after any context compaction or interruption:
-
-1. Reload `brief.md` and `dag.json`.
-2. Validate and replay the ledger:
-
-```text
-python <skill-dir>/scripts/check_orchestration.py <run-dir>/dag.json --events <run-dir>/events.jsonl --json
-```
-
-3. List live subagents and reconcile each one to exactly one claimed/running node.
-4. Compare receipts with actual files, diffs, commits when used, and test output.
-5. Mark vanished unproven work `orphaned`; do not guess that it completed.
-
-Do not start a new wave while an active agent or changed path is unaccounted for. Do not give a final answer while any worker is still active.
-
-## Finish with a final gate stage
-
-After every non-final node is integrated, run the final-gate nodes for:
-
-- system-wide integration;
-- independent cross-review;
-- restart/replay or resume-path verification;
-- end-to-end acceptance evidence.
-
-Run the full heavy suite once from the integrated state. Verify observable product behavior, not only schemas or green unit mocks.
-
-The final report must include the acceptance matrix, node receipts, final repo state, targeted and full-test evidence, unresolved risks, and a short explanation of every remaining sequential constraint. Distinguish semantic dependencies from capacity, hot-path, resource-lock, and heavy-test serialization. Explain why each semantic edge could not be removed safely.
+For planning, finish with a usable split. For preparation, distinguish created/ready tasks from executed work. For execution, finish when the assembled result meets scope or report the exact unresolved blocker. A launch-only handoff may name running tasks but must not imply continued background supervision without an authorized mechanism. Keep updates brief and do not make the owner operate the orchestration.

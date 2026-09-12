@@ -1,115 +1,73 @@
-# Orchestration contract
+# Handoff, integration and recovery
 
-Use this contract for an executing run or when recovering one after interruption. The root task is the control plane; native subagents are disposable workers.
+Use for execution or interrupted-run recovery. This protocol does not authorize starting implementation.
 
-## Frozen run artifacts
+## One integration baseline
 
-Resolve one external run directory before dispatch. Record its absolute path in the active task.
+Identify repo root, branch/commit and dirty tracked/untracked inputs. A SHA alone does not identify an uncommitted feature. Preserve necessary dirty inputs as a snapshot with file identities before workers depend on them. For non-repo work, use an immutable directory snapshot.
 
-`brief.md` must contain:
+Separate tasks do not inherit the parent's files or conversation automatically. Verify their inputs. Prefer isolated worktrees for overlapping repo work; assign disjoint exact paths in a shared checkout. Account for symlinks and alternate paths to the same file: the checker is lexical, not a permission guard.
 
-- the user-visible goal and mutation authority;
-- repo root and exact baseline revision or immutable snapshot identity;
-- authoritative plan and acceptance-criteria paths;
-- accepted decisions, implementation facts, unknowns, and non-goals;
-- live worker capacity and why it is safe;
-- the final proof required.
+Distinguish live shared inputs from pinned inputs in separate checkouts. A worker reading an unchanged accepted snapshot does not depend on an unrelated worker editing another copy of that file. Record the snapshot identity in the card; use `read_only_inputs` for live shared reads in the JSON conflict model. Root must verify that the supposedly pinned input really stays fixed. Shared interface changes still require acceptance before consumers use the new version, and overlapping output paths still need integration ownership.
 
-`dag.json` follows [dag-schema.md](dag-schema.md). Freeze it only after the checker passes and the root has reviewed derived waves.
+Each worker receives accepted prerequisite artifacts. Root incorporates its returned patch/commit, preserves unrelated changes, resolves conflicts and runs affected checks. Publishing remains separately authorized.
 
-`events.jsonl` contains one JSON object per line:
+## States and attempts
 
-```json
-{"seq":1,"node_id":"N1","from":"planned","to":"claimed","agent_ref":"native-agent-id","evidence":"Assigned the frozen N1 card"}
+```text
+planned -> claimed -> running -> worker_done -> verified -> integrated
 ```
 
-Sequence numbers are contiguous. Only the root appends. Include concrete evidence for `worker_done`, `verified`, `integrated`, `blocked`, `failed`, `orphaned`, and `superseded` transitions.
+- `claimed`: a ready node reserves capacity and a unique attempt; setup may be pending.
+- `running`: the intended task has started that attempt.
+- `worker_done`: result returned; relevant write/resource locks remain until review.
+- `verified`: root checked the result; consumers still wait for integration.
+- `integrated`: root incorporated the result into the recorded baseline.
+- `blocked`, `failed`, `orphaned`: concrete conditions, not mere slowness. Reassignment increments the attempt; an old reply cannot complete the new attempt.
 
-## State ownership
+Before releasing failed/blocked task locks, confirm the task stopped writing and account for partial changes. A ledger transition does not stop a process. Superseding a node does not satisfy its consumers; update their real dependency explicitly.
 
-The root alone may:
+Root records transitions. A stable `agent_ref` identifies an assignment; `threads.json` maps it to real thread/host/cursor. Pending setup can resolve without changing attempt identity. Acceptance transitions carry `actor: "root"`. These labels prevent accidental stale bookkeeping, not malicious forgery.
 
-- revise the DAG;
-- assign or reassign nodes;
-- change node status;
-- accept a receipt;
-- decide whether verification passed;
-- incorporate work into the integration state;
-- declare final completion.
+## Dispatch and handoff
 
-A worker owns only the paths and observable outcome on its card. It may inspect read-only inputs, must not touch forbidden paths, and must stop when an undisclosed shared edit becomes necessary.
+Send the mutation boundary, baseline, allowed paths, prerequisites, acceptance, outputs and narrow verification. Include run/node/attempt identity for reconciliation. A worker reports a new shared-path need before editing it.
 
-`worker_done` means only that a worker returned. `verified` means the root inspected the actual artifact/diff and the targeted evidence. `integrated` means the verified result is present in the controlled integration state and is safe for dependents to consume.
-
-## Worker dispatch card
-
-Send the worker the exact card plus:
-
-- current integration baseline;
-- whether the task is implementation or read-only forward testing;
-- explicit instruction not to broaden scope or edit the ledger;
-- the targeted command budget;
-- instruction to report newly discovered dependency or path overlap instead of working around it.
-
-Require this receipt shape in the response:
+Example receipt; scale detail to the task:
 
 ```json
 {
-  "node_id": "N1",
-  "status": "worker_done",
-  "summary": "Observable result produced",
-  "changed_paths": ["repo/relative/path"],
-  "deliverables": ["artifact or behavior"],
-  "verification": [
-    {"command": "targeted command", "result": "pass", "evidence": "concise output"}
-  ],
-  "assumptions": [],
-  "risks": [],
+  "node_id": "UI",
+  "attempt": 1,
+  "agent_ref": "ui-attempt-1",
+  "baseline": "accepted commit plus snapshot",
+  "summary": "Practice panel handles the agreed run states",
+  "changed_paths": ["app/components/PracticePanel.tsx"],
+  "deliverables": ["local commit or patch location"],
+  "verification": [{"check": "targeted UI path", "result": "pass", "evidence": "artifact location"}],
+  "limitations": [],
   "new_dependencies": []
 }
 ```
 
-Reject or rework a receipt when changed paths exceed ownership, evidence is only asserted, a prerequisite was guessed, or a deliverable is not observable.
+Inspect the actual diff: a worker's path list may be incomplete. Check acceptance against evidence. Return corrections to the same task unless its context/checkout is unusable. Never copy secrets into cards, logs or reports.
 
-## Reconciliation loop
+No global review barrier: while UI awaits review, an independent reader adapter can start. A task reading UI's changing unaccepted files waits. Root may accept UI while another worker edits unrelated paths.
 
-Run this loop before every dispatch and after context compaction:
+## Resume
 
-1. Read the frozen brief and DAG from disk.
-2. Replay the ledger with the checker.
-3. Inspect the live native-subagent registry.
-4. Map every live agent to exactly one `claimed` or `running` node.
-5. Inspect repo status/diff and map every changed path to one active or received card.
-6. Match every `worker_done` node to a returned receipt and actual artifact.
-7. Mark missing unproven work `orphaned`; never infer completion from silence.
-8. Resolve discrepancies before spawning anything else.
+1. Read the plan revision and bindings; validate the ledger if using JSON.
+2. Query real task IDs with recorded hosts/cursors. Do not use pending client IDs where real thread IDs are required.
+3. Match active attempts, completed results and changes to cards. Inspect unknown outcomes before retrying.
+4. Recover partial work. A task still running elsewhere is not orphaned.
+5. Recompute readiness from integrated prerequisites and actual free resources; continue independent work.
 
-If a worker requests a forbidden or shared path, pause it. The root either narrows the card, adds a genuine semantic edge in a new DAG revision, or schedules the hot path serially. Do not let workers negotiate ownership among themselves.
+Preserve preceding plan revisions. Pause only tasks affected by a contract/ownership change. Do not replay an old ledger against an incompatible graph. For a material split, start a named successor run referencing accepted artifacts instead of inventing an automatic ledger migration.
 
-## Integration and verification
+## Completion
 
-For each returned node, the root:
+An executing plan has root acceptance with checks appropriate to the result. Independent review workers return evidence; they do not self-accept the product. Review may start once its actual inputs are integrated; final root acceptance covers required contributions.
 
-1. checks changed paths against `owned_paths` and `forbidden_paths`;
-2. inspects the diff or produced artifact;
-3. reruns or independently validates narrow verification;
-4. checks all mapped acceptance criteria;
-5. records the receipt and `verified` event;
-6. incorporates it into the current integration state;
-7. records `integrated` only after incorporation is proven.
+The checker does not inspect receipts or the working tree. `--require-complete` checks the ledger's completion claims; root separately verifies artifacts and behavior. Report these as different proofs.
 
-Do not duplicate a heavy suite across workers. A heavy group has one owner in a wave. Run a shared subsystem gate once after its contributing nodes integrate, and run the complete suite once in the final gate stage.
-
-## Completion contract
-
-Completion requires:
-
-- every non-superseded node is `integrated`;
-- no native subagent remains active or unaccounted for;
-- every changed path maps to an accepted receipt;
-- every acceptance criterion maps to inspectable evidence;
-- system integration, cross-review, restart/replay, and E2E roles all ran after non-final work integrated;
-- the final repo state and test outputs are identified precisely;
-- remaining risks and sequential constraints are explained without calling capacity limits semantic dependencies.
-
-Use `--require-complete` with the checker before the final response.
+A launch-only handoff names running tasks and how to resume. An execution handoff names the accepted baseline, evidence and limitations. A completed task, valid DAG, build or running server alone is not a finished product.

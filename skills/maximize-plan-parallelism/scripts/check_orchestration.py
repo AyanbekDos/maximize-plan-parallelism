@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Validate a root-owned implementation DAG and its append-only event ledger."""
+"""Validate declared DAG/ledger consistency, not actual work, receipts or permissions."""
 
 from __future__ import annotations
 
 import argparse
 import copy
-import fnmatch
 import json
 import re
 import sys
@@ -31,6 +30,8 @@ LIST_FIELDS = (
 )
 PATH_FIELDS = ("owned_paths", "read_only_inputs", "forbidden_paths")
 ACTIVE_STATUSES = {"claimed", "running"}
+LOCK_STATUSES = ACTIVE_STATUSES | {"worker_done", "verified"}
+KNOWN_GATE_ROLES = REQUIRED_FINAL_ROLES | {"plan_review"}
 EVIDENCE_STATUSES = {
     "worker_done",
     "verified",
@@ -61,6 +62,8 @@ class Report:
         self.waves: list[dict[str, Any]] = []
         self.serialization: list[dict[str, Any]] = []
         self.node_status: dict[str, str] | None = None
+        self.ready_nodes: list[str] = []
+        self.blocked_nodes: dict[str, list[str]] = {}
 
     def error(self, message: str) -> None:
         self.errors.append(message)
@@ -71,6 +74,9 @@ class Report:
     def as_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "ok": not self.errors,
+            "validation_scope": "Declared plan and ledger only; product evidence requires root review",
+            "ready_nodes": self.ready_nodes,
+            "blocked_nodes": self.blocked_nodes,
             "errors": self.errors,
             "warnings": self.warnings,
             "waves": self.waves,
@@ -99,6 +105,10 @@ def normalize_path(raw: Any, case_sensitive: bool) -> tuple[str | None, str | No
     parts = value.split("/")
     if not value or any(part in {"", ".", ".."} for part in parts):
         return None, "contains an empty, dot, or parent segment"
+    if contains_glob(value) and not (
+        value == "**" or (value.endswith("/**") and not contains_glob(value[:-3]))
+    ):
+        return None, "unsupported glob pattern; use an exact path, **, or dir/**"
     normalized = value if case_sensitive else value.casefold()
     return normalized, None
 
@@ -115,22 +125,15 @@ def static_prefix(pattern: str) -> str:
 
 
 def patterns_overlap(left: str, right: str) -> bool:
-    left_glob = contains_glob(left)
-    right_glob = contains_glob(right)
-    if not left_glob and not right_glob:
-        return left == right
-    if left_glob and not right_glob:
-        return fnmatch.fnmatchcase(right, left)
-    if right_glob and not left_glob:
-        return fnmatch.fnmatchcase(left, right)
-    if left == right:
+    """Compare validated exact paths or terminal directory/** patterns."""
+    if left == "**" or right == "**" or left == right:
         return True
-    left_prefix = static_prefix(left)
-    right_prefix = static_prefix(right)
-    if not left_prefix or not right_prefix:
-        return True
-    return left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)
-
+    for directory, other in ((left, right), (right, left)):
+        if directory.endswith("/**"):
+            prefix = directory[:-3]
+            if other == prefix or other.startswith(prefix + "/"):
+                return True
+    return False
 
 def first_overlap(left: list[str], right: list[str]) -> tuple[str, str] | None:
     for left_pattern in left:
@@ -200,6 +203,8 @@ def declared_hot_reason(
 
 
 def scheduling_conflict(left: dict[str, Any], right: dict[str, Any]) -> str | None:
+    if left.get("exclusive_run") or right.get("exclusive_run"):
+        return "explicit exclusive_run"
     overlap = first_overlap(left["owned_paths_norm"], right["owned_paths_norm"])
     if overlap:
         return f"write path overlap {overlap[0]} <> {overlap[1]}"
@@ -228,123 +233,80 @@ def runtime_conflict(left: dict[str, Any], right: dict[str, Any]) -> str | None:
 def derive_waves(
     nodes: dict[str, dict[str, Any]], worker_slots: int, report: Report
 ) -> list[dict[str, Any]]:
-    dependents = {node_id: [] for node_id in nodes}
-    for node_id, node in nodes.items():
-        for prerequisite in node["prerequisites"]:
-            if prerequisite in nodes:
-                dependents[prerequisite].append(node_id)
-    critical_cache: dict[str, int] = {}
-
-    def critical_length(node_id: str) -> int:
-        if node_id not in critical_cache:
-            children = dependents[node_id]
-            critical_cache[node_id] = 1 + max(
-                (critical_length(child) for child in children), default=0
-            )
-        return critical_cache[node_id]
-
+    """Illustrative ordering only; live dispatch uses the ledger's ready frontier."""
     remaining = set(nodes)
     completed: set[str] = set()
     waves: list[dict[str, Any]] = []
     while remaining:
         ready = sorted(
-            node_id
-            for node_id in remaining
+            node_id for node_id in remaining
             if set(nodes[node_id]["prerequisites"]).issubset(completed)
         )
         if not ready:
-            return waves
-        root_ready = sorted(
-            (node_id for node_id in ready if nodes[node_id]["root_only"]),
-            key=lambda node_id: (-critical_length(node_id), node_id),
-        )
-        worker_ready = sorted(
-            (node_id for node_id in ready if not nodes[node_id]["root_only"]),
-            key=lambda node_id: (-critical_length(node_id), node_id),
-        )
+            break
         selected: list[str] = []
-        choose_root = bool(root_ready) and (
-            not worker_ready or critical_length(root_ready[0]) >= critical_length(worker_ready[0])
-        )
-        if choose_root:
-            selected = [root_ready[0]]
-            waiting = [node_id for node_id in ready if node_id not in selected]
-            if waiting:
-                report.serialization.append(
-                    {
-                        "type": "root_gate_scheduling",
-                        "wave": len(waves) + 1,
-                        "waiting": waiting,
-                        "reason": (
-                            f"The sole root takes ready critical-path gate {root_ready[0]} "
-                            f"(remaining path length {critical_length(root_ready[0])}) before "
-                            "co-dispatching workers"
-                        ),
-                    }
-                )
-        elif worker_ready:
-            for node_id in worker_ready:
-                if len(selected) >= worker_slots:
-                    continue
-                if any(scheduling_conflict(nodes[node_id], nodes[other]) for other in selected):
-                    continue
-                selected.append(node_id)
-            waiting_for_capacity = [node_id for node_id in worker_ready if node_id not in selected]
-            for waiting_node in waiting_for_capacity:
-                conflicts = [
-                    (selected_node, scheduling_conflict(nodes[waiting_node], nodes[selected_node]))
-                    for selected_node in selected
-                ]
-                conflicts = [(node_id, reason) for node_id, reason in conflicts if reason]
-                if conflicts:
-                    blocker, reason = conflicts[0]
-                    report.serialization.append(
-                        {
-                            "type": "wave_lock",
-                            "wave": len(waves) + 1,
-                            "nodes": [blocker, waiting_node],
-                            "reason": f"{reason} prevents co-dispatch in this wave",
-                        }
-                    )
-                else:
-                    report.serialization.append(
-                        {
-                            "type": "capacity",
-                            "wave": len(waves) + 1,
-                            "waiting": [waiting_node],
-                            "reason": f"worker capacity {worker_slots} is already filled",
-                        }
-                    )
-            if root_ready:
-                report.serialization.append(
-                    {
-                        "type": "critical_path_scheduling",
-                        "wave": len(waves) + 1,
-                        "waiting": root_ready,
-                        "reason": (
-                            f"Ready worker critical path {critical_length(worker_ready[0])} is longer "
-                            f"than ready root gate critical path {critical_length(root_ready[0])}"
-                        ),
-                    }
-                )
-        waves.append(
-            {
-                "wave": len(waves) + 1,
-                "nodes": selected,
-                "mode": "root_gate" if nodes[selected[0]]["root_only"] else "workers",
-            }
-        )
+        for node_id in ready:
+            node = nodes[node_id]
+            root_count = sum(nodes[other]["root_only"] for other in selected)
+            worker_count = len(selected) - root_count
+            if node["root_only"] and root_count >= 1:
+                continue
+            if not node["root_only"] and worker_count >= worker_slots:
+                continue
+            if any(runtime_conflict(node, nodes[other]) for other in selected):
+                continue
+            selected.append(node_id)
+        if not selected:
+            report.error("No schedulable node despite a nonempty ready frontier")
+            break
+        waves.append({"wave": len(waves) + 1, "nodes": selected, "mode": "illustrative"})
         completed.update(selected)
         remaining.difference_update(selected)
     return waves
+
+
+def prepare_v2(plan: dict[str, Any], report: Report) -> dict[str, Any]:
+    """Fill optional card fields without adding execution obligations."""
+    plan = copy.deepcopy(plan)
+    mode = plan.setdefault("mode", "plan")
+    transport = plan.setdefault("transport", "native")
+    if mode not in ("plan", "prepare", "execute"):
+        report.error("mode must be plan, prepare, or execute")
+    if transport not in ("threads", "native"):
+        report.error("transport must be threads or native")
+    plan.setdefault("policy", {})
+    plan.setdefault("shared_hot_paths", [])
+    plan.setdefault("resource_locks", {})
+    for raw in plan.get("nodes", []) if isinstance(plan.get("nodes"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        for required in ("id", "title", "outcome", "owned_paths", "deliverables",
+                         "targeted_verification", "acceptance_criteria"):
+            if required not in raw:
+                report.error(f"node {raw.get('id', '?')}: missing {required}")
+        raw.setdefault("kind", "implementation")
+        raw.setdefault("root_only", False)
+        raw.setdefault("final_gate", False)
+        raw.setdefault("prerequisite_reasons", {})
+        raw.setdefault("split_exception", None)
+        for field in LIST_FIELDS:
+            raw.setdefault(field, [])
+    return plan
 
 
 def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
     if not isinstance(plan, dict):
         report.error("plan root must be a JSON object")
         return None
-    if plan.get("schema_version") != 1:
-        report.error("schema_version must be 1")
+    version = plan.get("schema_version")
+    if type(version) is not int or version not in (1, 2):
+        report.error("schema_version must be 1 or 2")
+        return None
+    if version == 2:
+        plan = prepare_v2(plan, report)
+    else:
+        report.warn("Legacy v1: original final roles retained; attempt/actor checks are reduced")
+    mode = plan.get("mode", "execute") if version == 2 else "execute"
     for field in ("run_id", "goal"):
         if not is_nonempty_string(plan.get(field)):
             report.error(f"{field} must be a non-empty string")
@@ -355,6 +317,10 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
         for field in ("root", "baseline"):
             if not is_nonempty_string(repo.get(field)):
                 report.error(f"repo.{field} must be a non-empty string")
+        root = repo.get("root")
+        if version == 2 and is_nonempty_string(root):
+            if not Path(root).is_absolute() and not re.match(r"^[A-Za-z]:[/\\]", root):
+                report.error("repo.root must be an absolute workspace path")
 
     criteria_raw = plan.get("acceptance_criteria")
     criteria: dict[str, str] = {}
@@ -378,7 +344,13 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
     if not isinstance(policy, dict):
         report.error("policy must be an object")
         policy = {}
-    worker_slots = policy.get("worker_slots", 1)
+    required_roles = policy.get(
+        "required_final_roles", sorted(REQUIRED_FINAL_ROLES) if version == 1 else []
+    )
+    required_roles = valid_string_list("policy", "required_final_roles", required_roles, report)
+    if set(required_roles) - KNOWN_GATE_ROLES:
+        report.error("policy.required_final_roles contains an unknown role")
+    worker_slots = policy.get("worker_slots", 2 if version == 2 else 1)
     max_paths = policy.get("max_owned_paths_per_node", 6)
     max_subsystems = policy.get("max_subsystems_per_worker_node", 1)
     case_sensitive = policy.get("case_sensitive_paths", True)
@@ -409,8 +381,8 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
             reason = item.get("reason")
             if path_error:
                 report.error(f"shared_hot_paths[{index}].path {path_error}")
-            if not is_nonempty_string(reason) or len(reason.strip()) < 20:
-                report.error(f"shared_hot_paths[{index}].reason must be concrete (20+ characters)")
+            if not is_nonempty_string(reason) :
+                report.error(f"shared_hot_paths[{index}].reason must be non-empty")
             if normalized and is_nonempty_string(reason):
                 hot_paths.append({"path": normalized, "reason": reason.strip()})
 
@@ -420,8 +392,8 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
         resource_locks = {}
     else:
         for resource, reason in resource_locks.items():
-            if not is_nonempty_string(resource) or not is_nonempty_string(reason) or len(reason.strip()) < 20:
-                report.error(f"resource_locks.{resource} requires a concrete 20+ character reason")
+            if not is_nonempty_string(resource) or not is_nonempty_string(reason) :
+                report.error(f"resource_locks.{resource} requires a non-empty reason")
 
     nodes_raw = plan.get("nodes")
     if not isinstance(nodes_raw, list) or not nodes_raw:
@@ -443,7 +415,8 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
         for field in ("title", "outcome", "kind"):
             if not is_nonempty_string(node.get(field)):
                 report.error(f"node {node_id}: {field} must be a non-empty string")
-        for field in ("root_only", "final_gate"):
+        node.setdefault("exclusive_run", False)
+        for field in ("root_only", "final_gate", "exclusive_run"):
             if not isinstance(node.get(field), bool):
                 report.error(f"node {node_id}: {field} must be boolean")
                 node[field] = False
@@ -459,31 +432,35 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
             report.error(f"node {node_id}: split_exception must be null or a non-empty string")
         if is_nonempty_string(split_exception) and not node["root_only"]:
             report.error(f"node {node_id}: only a root_only node may use split_exception")
-        for field in ("deliverables", "targeted_verification", "acceptance_criteria", "subsystems"):
+        required_lists = ("deliverables", "targeted_verification", "acceptance_criteria")
+        if version == 1:
+            required_lists += ("subsystems",)
+        for field in required_lists:
             if not node[field]:
                 report.error(f"node {node_id}: {field} must not be empty")
         if len(node["owned_paths"]) > max_paths and not (
             node["root_only"] and is_nonempty_string(split_exception)
         ):
-            report.error(
-                f"node {node_id}: owns {len(node['owned_paths'])} paths, over limit {max_paths}; re-split it"
-            )
+            emit = report.error if version == 1 or "max_owned_paths_per_node" in policy else report.warn
+            emit(f"node {node_id}: owns {len(node['owned_paths'])} paths; review breadth (limit {max_paths})")
         if len(node["subsystems"]) > max_subsystems and not (
             node["root_only"] and is_nonempty_string(split_exception)
         ):
-            report.error(
-                f"node {node_id}: spans {len(node['subsystems'])} subsystems, over limit "
-                f"{max_subsystems}; re-split it"
-            )
+            emit = report.error if version == 1 or "max_subsystems_per_worker_node" in policy else report.warn
+            emit(f"node {node_id}: spans {len(node['subsystems'])} subsystems; review breadth (limit {max_subsystems})")
         if node["interfaces_produced"] and node.get("kind") != "interface_freeze":
             report.error(f"node {node_id}: only interface_freeze nodes may produce interfaces")
-        unknown_roles = sorted(set(node["gate_roles"]) - REQUIRED_FINAL_ROLES)
+        unknown_roles = sorted(set(node["gate_roles"]) - KNOWN_GATE_ROLES)
         if unknown_roles:
             report.error(f"node {node_id}: unknown gate_roles: {', '.join(unknown_roles)}")
         if node["gate_roles"] and not node["final_gate"]:
             report.error(f"node {node_id}: gate_roles require final_gate=true")
-        if node["final_gate"] and not node["gate_roles"]:
-            report.error(f"node {node_id}: final_gate requires at least one gate role")
+        if node["final_gate"] != (node.get("kind") == "final_gate"):
+            report.error(f"node {node_id}: final_gate and kind=final_gate must agree")
+        if node["final_gate"] and not node["root_only"]:
+            report.error(f"node {node_id}: final acceptance must be root_only")
+        if version == 1 and node["final_gate"] and not node["gate_roles"]:
+            report.error(f"node {node_id}: legacy final_gate requires gate_roles")
         for resource in node["exclusive_resources"]:
             if resource not in resource_locks:
                 report.error(f"node {node_id}: exclusive resource {resource!r} is not defined")
@@ -523,9 +500,9 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
             elif prerequisite not in nodes:
                 report.error(f"node {node_id}: unknown prerequisite {prerequisite}")
             reason = node["prerequisite_reasons"].get(prerequisite)
-            if not is_nonempty_string(reason) or len(reason.strip()) < 20:
+            if not is_nonempty_string(reason) :
                 report.error(
-                    f"node {node_id}: prerequisite {prerequisite} needs a concrete 20+ character reason"
+                    f"node {node_id}: prerequisite {prerequisite} needs a non-empty reason"
                 )
             elif prerequisite in nodes:
                 report.serialization.append(
@@ -562,8 +539,6 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
                 )
             else:
                 producers[interface] = node_id
-    if not any(node.get("kind") == "interface_freeze" for node in nodes.values()):
-        report.error("large implementation DAG requires at least one interface_freeze node")
     for node_id, node in nodes.items():
         for interface in node["interfaces_consumed"]:
             producer = producers.get(interface)
@@ -575,10 +550,10 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
                 )
 
     final_nodes = [node_id for node_id, node in nodes.items() if node["final_gate"]]
-    if not final_nodes:
-        report.error("DAG requires a final gate stage")
+    if mode == "execute" and not final_nodes:
+        report.error("execute mode requires a root acceptance final gate")
     covered_roles = set().union(*(set(nodes[node_id]["gate_roles"]) for node_id in final_nodes)) if final_nodes else set()
-    missing_roles = sorted(REQUIRED_FINAL_ROLES - covered_roles)
+    missing_roles = sorted(set(required_roles) - covered_roles)
     if missing_roles:
         report.error(f"final gate stage is missing roles: {', '.join(missing_roles)}")
     non_final = {node_id for node_id, node in nodes.items() if not node["final_gate"]}
@@ -644,7 +619,7 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
                             "type": "exclusive_resource",
                             "nodes": [left_id, right_id],
                             "resource": resource,
-                            "reason": resource_locks[resource],
+                            "reason": resource_locks.get(resource, "Undeclared resource"),
                         }
                     )
             shared_heavy = sorted(set(left["heavy_test_groups"]) & set(right["heavy_test_groups"]))
@@ -664,6 +639,8 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
     return {
         "nodes": nodes,
         "ancestors": ancestors,
+        "schema_version": version,
+        "mode": mode,
         "worker_slots": worker_slots,
         "final_nodes": set(final_nodes),
         "non_final_nodes": non_final,
@@ -673,8 +650,8 @@ def validate_plan(plan: Any, report: Report) -> dict[str, Any] | None:
 def load_events(path: Path, report: Report) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError) as exc:
         report.error(f"cannot read events file {path}: {exc}")
         return events
     for line_number, line in enumerate(lines, start=1):
@@ -694,116 +671,121 @@ def load_events(path: Path, report: Report) -> list[dict[str, Any]]:
     return events
 
 
+def ready_frontier(
+    context: dict[str, Any], statuses: dict[str, str], report: Report
+) -> None:
+    """Capacity is released at worker_done, but unreviewed files remain locked."""
+    nodes = context["nodes"]
+    active = [node_id for node_id, status in statuses.items() if status in ACTIVE_STATUSES]
+    locked = [node_id for node_id, status in statuses.items() if status in LOCK_STATUSES]
+    report.ready_nodes = []
+    report.blocked_nodes = {}
+    for node_id, node in nodes.items():
+        if statuses[node_id] != "planned":
+            continue
+        reasons = []
+        missing = [p for p in node["prerequisites"] if statuses.get(p) != "integrated"]
+        if missing:
+            reasons.append("prerequisites not integrated: " + ", ".join(missing))
+        if node["root_only"]:
+            if any(nodes[other]["root_only"] for other in active):
+                reasons.append("root capacity occupied")
+        elif sum(not nodes[other]["root_only"] for other in active) >= context["worker_slots"]:
+            reasons.append("worker capacity occupied")
+        for other in locked:
+            conflict = runtime_conflict(node, nodes[other])
+            if conflict:
+                reasons.append(f"{other}: {conflict}")
+        if reasons:
+            report.blocked_nodes[node_id] = reasons
+        else:
+            report.ready_nodes.append(node_id)
+    report.ready_nodes.sort()
+
+
 def validate_events(
     events: list[dict[str, Any]], context: dict[str, Any], report: Report, require_complete: bool
 ) -> None:
     nodes = context["nodes"]
-    worker_slots = context["worker_slots"]
+    version = context.get("schema_version", 1)
     statuses = {node_id: "planned" for node_id in nodes}
+    attempts = {node_id: 0 for node_id in nodes}
     agent_refs: dict[str, str] = {}
     for expected_seq, event in enumerate(events, start=1):
+        if not isinstance(event, dict):
+            report.error(f"events entry {expected_seq}: must be an object")
+            continue
         line = event.get("_line", expected_seq)
-        if event.get("seq") != expected_seq:
-            report.error(
-                f"events line {line}: seq must be contiguous; expected {expected_seq}, got {event.get('seq')!r}"
-            )
+        errors_before = len(report.errors)
+        if type(event.get("seq")) is not int or event["seq"] != expected_seq:
+            report.error(f"events line {line}: seq must be contiguous; expected {expected_seq}")
         node_id = event.get("node_id")
-        if node_id not in nodes:
+        if not isinstance(node_id, str) or node_id not in nodes:
             report.error(f"events line {line}: unknown node_id {node_id!r}")
             continue
         current = statuses[node_id]
-        declared_from = event.get("from")
         target = event.get("to")
-        if declared_from != current:
-            report.error(
-                f"events line {line}: node {node_id} expected from={current!r}, got {declared_from!r}"
-            )
-        if target not in TRANSITIONS.get(current, set()):
-            report.error(f"events line {line}: invalid transition for {node_id}: {current} -> {target}")
+        if event.get("from") != current or not isinstance(target, str) or target not in TRANSITIONS[current]:
+            report.error(f"events line {line}: invalid transition for {node_id}: {current} -> {target!r}")
             continue
         if target in EVIDENCE_STATUSES and not is_nonempty_string(event.get("evidence")):
             report.error(f"events line {line}: transition to {target} requires evidence")
+        ref = event.get("agent_ref")
+        ref = ref.strip() if isinstance(ref, str) else None
+        attempt = event.get("attempt")
+        if version == 2:
+            if target == "claimed":
+                if type(attempt) is not int or attempt != attempts[node_id] + 1:
+                    report.error(f"events line {line}: claim requires next positive attempt")
+            elif attempts[node_id] > 0:
+                if type(attempt) is not int or attempt != attempts[node_id]:
+                    report.error(f"events line {line}: stale or missing attempt for {node_id}")
+                if target in {"running", "worker_done"} and ref != agent_refs.get(node_id):
+                    report.error(f"events line {line}: {target} requires matching agent_ref")
+            if target in {"verified", "integrated"} and event.get("actor") != "root":
+                report.error(f"events line {line}: {target} requires actor=root")
         if target == "claimed":
-            unresolved = sorted(
-                other_id
-                for other_id, status in statuses.items()
-                if status in {"worker_done", "verified"} and other_id != node_id
-            )
-            if unresolved:
-                report.error(
-                    f"events line {line}: reconcile worker_done/verified nodes before a new claim: "
-                    f"{', '.join(unresolved)}"
-                )
-            missing_prerequisites = sorted(
-                prerequisite
-                for prerequisite in nodes[node_id]["prerequisites"]
-                if statuses.get(prerequisite) != "integrated"
-            )
-            if missing_prerequisites:
-                report.error(
-                    f"events line {line}: node {node_id} is not ready; prerequisites not integrated: "
-                    f"{', '.join(missing_prerequisites)}"
-                )
-            active_ids = [other_id for other_id, status in statuses.items() if status in ACTIVE_STATUSES]
+            missing = [p for p in nodes[node_id]["prerequisites"] if statuses.get(p) != "integrated"]
+            if missing:
+                report.error(f"events line {line}: prerequisites not integrated: {', '.join(missing)}")
+            active = [other for other in nodes if statuses[other] in ACTIVE_STATUSES]
+            locked = [other for other in nodes if statuses[other] in LOCK_STATUSES]
             if nodes[node_id]["root_only"]:
-                if active_ids:
-                    report.error(
-                        f"events line {line}: root_only node {node_id} cannot start with active nodes: "
-                        f"{', '.join(sorted(active_ids))}"
-                    )
-            else:
-                if any(nodes[other_id]["root_only"] for other_id in active_ids):
-                    report.error(f"events line {line}: worker node cannot start while a root_only gate is active")
-                active_workers = [other_id for other_id in active_ids if not nodes[other_id]["root_only"]]
-                if len(active_workers) >= worker_slots:
-                    report.error(
-                        f"events line {line}: worker capacity {worker_slots} exceeded by node {node_id}"
-                    )
-            for other_id in active_ids:
-                conflict = runtime_conflict(nodes[node_id], nodes[other_id])
+                if any(nodes[other]["root_only"] for other in active):
+                    report.error(f"events line {line}: root capacity occupied")
+            elif sum(not nodes[other]["root_only"] for other in active) >= context["worker_slots"]:
+                report.error(f"events line {line}: worker capacity exceeded")
+            for other in locked:
+                conflict = runtime_conflict(nodes[node_id], nodes[other])
                 if conflict:
-                    report.error(
-                        f"events line {line}: active nodes {node_id} and {other_id} conflict: {conflict}"
-                    )
-            agent_ref = event.get("agent_ref")
-            if not is_nonempty_string(agent_ref):
-                report.error(f"events line {line}: claimed transition requires agent_ref")
-            elif nodes[node_id]["root_only"] and agent_ref.strip().casefold() != "root":
-                report.error(f"events line {line}: root_only node {node_id} must use agent_ref='root'")
-            elif not nodes[node_id]["root_only"] and agent_ref.strip().casefold() == "root":
-                report.error(f"events line {line}: worker node {node_id} cannot use agent_ref='root'")
-            elif agent_ref in (
-                agent_refs.get(other_id) for other_id in active_ids if other_id != node_id
-            ):
-                report.error(f"events line {line}: agent_ref {agent_ref!r} is already active")
-            if is_nonempty_string(agent_ref):
-                agent_refs[node_id] = agent_ref.strip()
+                    report.error(f"events line {line}: {other} holds conflicting lock: {conflict}")
+            if not is_nonempty_string(ref):
+                report.error(f"events line {line}: claimed requires agent_ref")
+            elif nodes[node_id]["root_only"] and ref != "root":
+                report.error(f"events line {line}: root_only claim requires agent_ref=root")
+            elif not nodes[node_id]["root_only"] and ref == "root":
+                report.error(f"events line {line}: worker claim cannot use agent_ref=root")
+            elif ref in (agent_refs.get(other) for other in active):
+                report.error(f"events line {line}: agent_ref already active")
         if target == "integrated":
-            missing_prerequisites = sorted(
-                prerequisite
-                for prerequisite in nodes[node_id]["prerequisites"]
-                if statuses.get(prerequisite) != "integrated"
-            )
-            if missing_prerequisites:
-                report.error(
-                    f"events line {line}: cannot integrate {node_id}; prerequisites not integrated: "
-                    f"{', '.join(missing_prerequisites)}"
-                )
+            missing = [p for p in nodes[node_id]["prerequisites"] if statuses.get(p) != "integrated"]
+            if missing:
+                report.error(f"events line {line}: cannot integrate before prerequisites")
+        if len(report.errors) != errors_before:
+            continue
+        if target == "claimed":
+            agent_refs[node_id] = ref
+            attempts[node_id] = attempt if version == 2 else attempts[node_id] + 1
         statuses[node_id] = target
-
     report.node_status = dict(sorted(statuses.items()))
+    ready_frontier(context, statuses, report)
     if require_complete:
-        incomplete = sorted(
-            node_id for node_id, status in statuses.items() if status not in {"integrated", "superseded"}
-        )
+        incomplete = [node for node, status in statuses.items() if status not in {"integrated", "superseded"}]
         if incomplete:
-            report.error(f"run is incomplete: {', '.join(incomplete)}")
-        missing_final = sorted(
-            node_id for node_id in context["final_nodes"] if statuses[node_id] != "integrated"
-        )
+            report.error("run is incomplete: " + ", ".join(sorted(incomplete)))
+        missing_final = [node for node in context["final_nodes"] if statuses[node] != "integrated"]
         if missing_final:
-            report.error(f"final gate nodes must be integrated, not superseded: {', '.join(missing_final)}")
-
+            report.error("final gate nodes must be integrated, not superseded")
 
 def example_plan() -> dict[str, Any]:
     def card(
@@ -949,43 +931,18 @@ def complete_events() -> list[dict[str, Any]]:
 
 
 def run_self_test() -> int:
-    failures: list[str] = []
-    valid_report = Report()
-    context = validate_plan(example_plan(), valid_report)
-    if valid_report.errors:
-        failures.append(f"valid plan rejected: {valid_report.errors}")
-    expected_waves = [["F"], ["A", "B"], ["G"]]
-    actual_waves = [wave["nodes"] for wave in valid_report.waves]
-    if actual_waves != expected_waves:
-        failures.append(f"unexpected waves: {actual_waves}")
-    if context is not None:
-        validate_events(complete_events(), context, valid_report, require_complete=True)
-        if valid_report.errors:
-            failures.append(f"valid ledger rejected: {valid_report.errors}")
-
-    cycle_plan = example_plan()
-    cycle_plan["nodes"][0]["prerequisites"] = ["G"]
-    cycle_plan["nodes"][0]["prerequisite_reasons"] = {
-        "G": "The deliberately invalid self-test creates a cycle through the final gate"
-    }
-    cycle_report = Report()
-    validate_plan(cycle_plan, cycle_report)
-    if not any("cycle" in error.casefold() for error in cycle_report.errors):
-        failures.append("cycle was not detected")
-
-    overlap_plan = example_plan()
-    overlap_plan["nodes"][2]["owned_paths"] = ["src/a/**"]
-    overlap_report = Report()
-    validate_plan(overlap_plan, overlap_report)
-    if not any("unordered write overlap" in error for error in overlap_report.errors):
-        failures.append("undeclared concurrent write overlap was not detected")
-
-    if failures:
-        print(json.dumps({"ok": False, "failures": failures}, indent=2))
-        return 1
-    print(json.dumps({"ok": True, "tests": 4}, indent=2))
-    return 0
-
+    import io
+    import runpy
+    import unittest
+    namespace = runpy.run_path(str(Path(__file__).with_name("test_orchestration.py")))
+    output = io.StringIO()
+    result = unittest.TextTestRunner(stream=output, verbosity=2).run(namespace["build_suite"]())
+    print(json.dumps({
+        "ok": result.wasSuccessful(),
+        "tests": result.testsRun,
+        "details": output.getvalue() if not result.wasSuccessful() else "All regression scenarios passed",
+    }, indent=2))
+    return 0 if result.wasSuccessful() else 1
 
 def print_human(report: Report) -> None:
     print("PASS" if not report.errors else "FAIL")
@@ -1015,26 +972,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--events", type=Path, help="Optional events.jsonl to replay")
     parser.add_argument("--require-complete", action="store_true", help="Require all nodes integrated")
     parser.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON report")
-    parser.add_argument("--self-test", action="store_true", help="Run deterministic built-in tests")
+    parser.add_argument("--self-test", action="store_true", help="Run deterministic regression scenarios")
+    parser.add_argument("--example", action="store_true", help="Print a v2 example without executing work")
     args = parser.parse_args(argv)
     if args.self_test:
         return run_self_test()
+    if args.example:
+        example = example_plan()
+        example.update(schema_version=2, mode="execute", transport="threads")
+        example["policy"]["required_final_roles"] = ["integration"]
+        print(json.dumps(example, indent=2))
+        return 0
     if args.plan is None:
         parser.error("plan is required unless --self-test is used")
 
     report = Report()
     try:
-        plan = json.loads(args.plan.read_text(encoding="utf-8"))
-    except OSError as exc:
+        plan = json.loads(args.plan.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError) as exc:
         report.error(f"cannot read plan {args.plan}: {exc}")
         plan = None
     except json.JSONDecodeError as exc:
         report.error(f"invalid plan JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}")
         plan = None
     context = validate_plan(plan, report) if plan is not None else None
+    if context is not None and not report.errors:
+        ready_frontier(context, {node: "planned" for node in context["nodes"]}, report)
     if args.require_complete and args.events is None:
         report.error("--require-complete requires --events")
-    if args.events is not None and context is not None:
+    if args.events is not None and context is not None and not report.errors:
         events = load_events(args.events, report)
         validate_events(events, context, report, args.require_complete)
 
